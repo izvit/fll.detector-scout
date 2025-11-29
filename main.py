@@ -67,6 +67,9 @@ class GridCanvas(QWidget):
         self._anim_timer.timeout.connect(self._tick)
         # visited grid cells (set of (row_idx, col_idx) using 1-based indices for content area)
         self.visited = set()
+        # purple special drone and purple pindrops
+        self.purple_drone = None  # dict like quad: {'pos','vel','size','battery'}
+        self.purple_pins: list[tuple[str, int]] = []
 
     def add_pin(self, row_letter: str, col_num: int):
         """Add a pin if not already present. row_letter is like 'B' or 'AA', col_num is integer."""
@@ -239,6 +242,31 @@ class GridCanvas(QWidget):
 
             painter.restore()
 
+        # Draw purple pindrops (distinct color)
+        for (r_letter, c_num) in getattr(self, 'purple_pins', []):
+            try:
+                r = self._letters_to_index(r_letter)
+                c = int(c_num)
+            except Exception:
+                continue
+            cell_x = c * cs
+            cell_y = r * cs
+            cx = cell_x + cs / 2
+            cy = cell_y + cs / 2
+            painter.save()
+            pcol = QColor(155, 50, 200)
+            painter.setPen(QPen(pcol.darker(110)))
+            painter.setBrush(pcol)
+            pr = cs * 0.16
+            painter.drawEllipse(int(cx - pr), int(cy - pr), int(pr * 2), int(pr * 2))
+            # small tail
+            t1 = QPointF(cx - pr * 0.7, cy + pr * 0.25)
+            t2 = QPointF(cx + pr * 0.7, cy + pr * 0.25)
+            t3 = QPointF(cx, cy + pr * 0.9)
+            poly2 = QPolygonF([t1, t2, t3])
+            painter.drawPolygon(poly2)
+            painter.restore()
+
         # Draw finalized rectangles
         # Draw finalized rectangles (red striped)
         rect_pen = QPen(QColor(160, 20, 20))
@@ -302,7 +330,82 @@ class GridCanvas(QWidget):
             except Exception:
                 # swallow drawing errors for robustness
                 continue
+        # Draw the special purple drone (if present) so it's clearly visible
+        pd = getattr(self, 'purple_drone', None)
+        if pd is not None:
+            try:
+                pos = pd.get('pos')
+                size = pd.get('size', self.cell_size * 0.9)
+                if pos is not None:
+                    # draw a distinct purple ellipse for the special drone
+                    # Prefer rendering a tinted SVG for the purple drone if an SVG renderer is available.
+                    drawn = False
+                    try:
+                        if getattr(self, '_quad_renderer', None) is not None:
+                            # render the SVG into a temporary pixmap at the desired size
+                            pix = QPixmap(int(size), int(size))
+                            pix.fill(Qt.transparent)
+                            ptmp = QPainter(pix)
+                            try:
+                                # render the source SVG (quadcopter) into the pixmap
+                                self._quad_renderer.render(ptmp, QRectF(0, 0, size, size))
+                                # tint it using SourceIn composition so the shape keeps its alpha
+                                ptmp.setCompositionMode(QPainter.CompositionMode_SourceIn)
+                                tint = QColor(155, 50, 200, 220)
+                                ptmp.fillRect(QRectF(0, 0, size, size), tint)
+                                ptmp.end()
+                                # draw the tinted pixmap centered at the drone position
+                                painter.drawPixmap(int(pos.x() - size / 2.0), int(pos.y() - size / 2.0), pix)
+                                drawn = True
+                            finally:
+                                if ptmp.isActive():
+                                    ptmp.end()
+                    except Exception:
+                        drawn = False
 
+                    if not drawn:
+                        try:
+                            painter.save()
+                            painter.setPen(QPen(QColor(100, 30, 120).darker(110)))
+                            painter.setBrush(QColor(155, 50, 200, 220))
+                            painter.drawEllipse(QRectF(pos.x() - size / 2.0, pos.y() - size / 2.0, size, size))
+                            painter.restore()
+                        except Exception:
+                            pass
+
+                    # small battery indicator near the purple drone (visual only)
+                    try:
+                        bat = pd.get('battery', None)
+                        if bat is not None:
+                            bar_w = max(12, int(size * 0.28))
+                            bar_h = max(6, int(size * 0.12))
+                            tl_x = pos.x() - size / 2.0 + 4
+                            tl_y = pos.y() - size / 2.0 + 4
+                            painter.save()
+                            border_pen = QPen(QColor(30, 30, 30))
+                            border_pen.setWidth(1)
+                            painter.setPen(border_pen)
+                            painter.setBrush(QColor(40, 40, 40, 200))
+                            painter.drawRect(tl_x, tl_y, bar_w, bar_h)
+                            cap_w = max(2, int(bar_w * 0.08))
+                            cap_rect = QRectF(tl_x + bar_w, tl_y + bar_h * 0.18, cap_w, bar_h * 0.64)
+                            painter.drawRect(cap_rect)
+                            pct = max(0.0, min(100.0, float(bat))) / 100.0
+                            inner_w = max(1, int((bar_w - 2) * pct))
+                            if pct > 0.6:
+                                fill_col = QColor(160, 120, 240)
+                            elif pct > 0.3:
+                                fill_col = QColor(220, 180, 120)
+                            else:
+                                fill_col = QColor(200, 80, 120)
+                            painter.setPen(Qt.NoPen)
+                            painter.setBrush(fill_col)
+                            painter.drawRect(tl_x + 1, tl_y + 1, inner_w, bar_h - 2)
+                            painter.restore()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
         # Draw current rectangle (dashed outline, lighter striped fill)
         if self._current_rect is not None:
             dash_pen = QPen(QColor(180, 30, 30))
@@ -358,6 +461,29 @@ class GridCanvas(QWidget):
                     bat = random.uniform(60.0, 100.0)
                     self.quadcopters.append({'pos': QPointF(x, y), 'vel': QPointF(vx, vy), 'size': size, 'battery': bat})
 
+            # also create a single purple drone (special)
+            try:
+                # place purple drone avoiding rectangles too
+                p_size = cs * 0.9
+                placed = False
+                attempts = 0
+                while not placed and attempts < 60:
+                    attempts += 1
+                    px = random.uniform(area_x0 + 10, max(area_x0 + 11, area_x1 - 10))
+                    py = random.uniform(area_y0 + 10, max(area_y0 + 11, area_y1 - 10))
+                    pbbox = QRectF(px - p_size / 2.0, py - p_size / 2.0, p_size, p_size)
+                    if not self._bbox_intersects_rects(pbbox):
+                        pvx = random.uniform(-2.2, 2.2) * 1.3
+                        pvy = random.uniform(-2.2, 2.2) * 1.3
+                        pbat = random.uniform(80.0, 100.0)
+                        self.purple_drone = {'pos': QPointF(px, py), 'vel': QPointF(pvx, pvy), 'size': p_size, 'battery': pbat}
+                        placed = True
+                if not placed:
+                    # fallback
+                    self.purple_drone = {'pos': QPointF(area_x0 + 20, area_y0 + 20), 'vel': QPointF(1.3, -1.3), 'size': p_size, 'battery': 90.0}
+            except Exception:
+                self.purple_drone = None
+
             if self.quadcopters:
                 self._anim_timer.start()
                 self.update()
@@ -374,6 +500,13 @@ class GridCanvas(QWidget):
             if self.quadcopters:
                 self.quadcopters.clear()
                 self.update()
+        except Exception:
+            pass
+        # clear purple drone and purple pins
+        try:
+            self.purple_drone = None
+            if hasattr(self, 'purple_pins') and self.purple_pins:
+                self.purple_pins.clear()
         except Exception:
             pass
 
@@ -486,6 +619,62 @@ class GridCanvas(QWidget):
         except Exception:
             pass
 
+        # move purple drone (if present) and mark visited
+        try:
+            pd = self.purple_drone
+            if pd is not None:
+                pos = pd['pos']
+                vel = pd['vel']
+                size = pd.get('size', cs * 0.9)
+                half = size / 2.0
+
+                # X
+                next_x = QPointF(pos.x() + vel.x(), pos.y())
+                bbox_x = QRectF(next_x.x() - half, next_x.y() - half, size, size)
+                if self._bbox_intersects_rects(bbox_x):
+                    vel.setX(-vel.x())
+                else:
+                    pos.setX(next_x.x())
+
+                # Y
+                next_y = QPointF(pos.x(), pos.y() + vel.y())
+                bbox_y = QRectF(next_y.x() - half, next_y.y() - half, size, size)
+                if self._bbox_intersects_rects(bbox_y):
+                    vel.setY(-vel.y())
+                else:
+                    pos.setY(next_y.y())
+
+                # bounds bounce with small perturbation
+                if pos.x() - half < area_x0:
+                    pos.setX(area_x0 + half)
+                    vel.setX(-vel.x() + random.uniform(-0.6, 0.6))
+                if pos.x() + half > area_x1:
+                    pos.setX(area_x1 - half)
+                    vel.setX(-vel.x() + random.uniform(-0.6, 0.6))
+                if pos.y() - half < area_y0:
+                    pos.setY(area_y0 + half)
+                    vel.setY(-vel.y() + random.uniform(-0.6, 0.6))
+                if pos.y() + half > area_y1:
+                    pos.setY(area_y1 - half)
+                    vel.setY(-vel.y() + random.uniform(-0.6, 0.6))
+
+                # slight battery drain
+                try:
+                    pd['battery'] = max(0.0, pd.get('battery', 100.0) - 0.03)
+                except Exception:
+                    pass
+
+                # mark visited cell
+                try:
+                    col_idx = int(pos.x() // cs)
+                    row_idx = int(pos.y() // cs)
+                    if row_idx >= 1 and col_idx >= 1 and col_idx < total_cols and row_idx < total_rows:
+                        self.visited.add((row_idx, col_idx))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     def _bbox_intersects_rects(self, bbox: QRectF) -> bool:
         """Return True if bbox intersects any user-drawn rectangle."""
         try:
@@ -495,6 +684,31 @@ class GridCanvas(QWidget):
         except Exception:
             return False
         return False
+
+    def place_purple_pindrop(self):
+        """Place a purple pindrop at the purple drone's current grid cell (if any)."""
+        try:
+            pd = self.purple_drone
+            if pd is None:
+                return
+            pos = pd.get('pos')
+            if pos is None:
+                return
+            cs = self.cell_size
+            col_idx = int(pos.x() // cs)
+            row_idx = int(pos.y() // cs)
+            if row_idx < 1 or col_idx < 1:
+                return
+            # convert to letter index and 1-based column
+            row_letter = self._index_to_letters(row_idx)
+            col_num = int(col_idx)
+            key = (row_letter.upper(), col_num)
+            if key in getattr(self, 'purple_pins', []):
+                return
+            self.purple_pins.append(key)
+            self.update()
+        except Exception:
+            pass
 
     def _letters_to_index(self, s: str) -> int:
         # Convert letters like 'A' or 'AA' to 1-based index
@@ -658,6 +872,32 @@ class MainWindow(QMainWindow):
             "QToolButton:checked { background-color: rgba(0,0,0,0.18); border-radius: 4px; }"
         )
 
+        # Pindrop button (icon + fallback)
+        pin_btn = QToolButton()
+        pin_btn.setToolTip("Pindrop")
+        pin_btn.setFixedSize(40, 40)
+        try:
+            renderer_pin = QSvgRenderer("assets/pindrop.svg")
+            pix_pin = QPixmap(20, 20)
+            pix_pin.fill(Qt.transparent)
+            p_pin = QPainter(pix_pin)
+            renderer_pin.render(p_pin)
+            p_pin.end()
+            pin_btn.setIcon(QIcon(pix_pin))
+            pin_btn.setIconSize(QSize(20, 20))
+        except Exception:
+            pin_btn.setText("📍")
+
+        pin_btn.setStyleSheet(
+            "QToolButton { background: transparent; border: none; color: white; }"
+            "QToolButton:hover { background-color: rgba(255,255,255,0.06); border-radius: 4px; }"
+        )
+        # when pressed, have the purple drone drop a pindrop
+        try:
+            pin_btn.clicked.connect(lambda: self.canvas.place_purple_pindrop())
+        except Exception:
+            pass
+
         # Clear rectangles button
         clear_btn = QToolButton()
         clear_btn.setToolTip("Clear rectangles")
@@ -669,6 +909,7 @@ class MainWindow(QMainWindow):
         header_layout.addWidget(title)
         header_layout.addWidget(play_btn)
         header_layout.addWidget(rect_btn)
+        header_layout.addWidget(pin_btn)
         header_layout.addWidget(clear_btn)
 
         main_layout.addWidget(header_widget)
@@ -716,7 +957,14 @@ class MainWindow(QMainWindow):
     def _on_serial_pin(self, row: str, col: int):
         # Called on GUI thread when serial delivers a pin coordinate
         try:
-            self.canvas.add_pin(row, col)
+            # Treat any serial message as a notification to place a purple pindrop
+            # at the purple drone's current location (do not add a regular pin).
+            try:
+                self.canvas.place_purple_pindrop()
+                # optional: brief debug print to console
+                # print(f"Serial: placed purple pindrop for message {row},{col}")
+            except Exception:
+                pass
         except Exception:
             pass
 
